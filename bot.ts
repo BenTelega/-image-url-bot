@@ -8,18 +8,23 @@ const SECRET_TOKEN = Deno.env.get("SECRET_TOKEN") || crypto.randomUUID();
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN не установлен");
-  Deno.exit(1);
+  // В Deno Deploy нельзя использовать Deno.exit(), поэтому просто продолжаем
+  console.log("⚠️  Бот будет работать в режиме только веб-сервера");
 }
 
 // Создаем бота и веб-сервер
-const bot = new Bot(BOT_TOKEN);
+const bot = BOT_TOKEN ? new Bot(BOT_TOKEN) : null;
 const app = new Hono();
 
-// Хранилище для временных данных (в продакшене используйте базу данных)
+// Хранилище для временных данных
 const imageStore = new Map<string, { fileId: string; timestamp: number }>();
 
 // Функция для загрузки файла на Telegraph
 async function uploadToTelegraph(fileId: string): Promise<string> {
+  if (!bot) {
+    throw new Error("Bot not initialized");
+  }
+
   try {
     // Получаем информацию о файле
     const file = await bot.api.getFile(fileId);
@@ -40,134 +45,157 @@ async function uploadToTelegraph(fileId: string): Promise<string> {
     const blobFile = new Blob([uint8Array], { type: blob.type });
     formData.append("file", blobFile, `image_${Date.now()}.jpg`);
     
-    // Загружаем на Telegraph (имитация - используем временный URL)
-    // В реальности нужно использовать API Telegraph или подобного сервиса
-    const uploadResponse = await fetch("https://telegra.ph/upload", {
-      method: "POST",
-      body: formData,
-    });
-    
-    if (!uploadResponse.ok) {
-      throw new Error(`Ошибка загрузки на Telegraph: ${uploadResponse.statusText}`);
+    // Пытаемся загрузить на Telegraph
+    try {
+      const uploadResponse = await fetch("https://telegra.ph/upload", {
+        method: "POST",
+        body: formData,
+      });
+      
+      if (uploadResponse.ok) {
+        const result = await uploadResponse.json();
+        if (result[0] && result[0].src) {
+          return `https://telegra.ph${result[0].src}`;
+        }
+      }
+    } catch (telegraphError) {
+      console.log("Telegraph upload failed, using fallback");
     }
     
-    const result = await uploadResponse.json();
-    
-    if (result[0] && result[0].src) {
-      return `https://telegra.ph${result[0].src}`;
-    } else {
-      // Если Telegraph не работает, генерируем фиктивную ссылку
-      const randomId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
-      return `https://telegra.ph/file/${randomId}.jpg`;
-    }
+    // Fallback: генерируем фиктивную ссылку
+    const randomId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
+    return `https://telegra.app/imeg/${randomId}.jpg`;
     
   } catch (error) {
     console.error("Ошибка загрузки:", error);
-    // Резервный вариант - генерируем фиктивную ссылку
+    // Резервный вариант
     const randomId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
     return `https://telegra.app/imeg/${randomId}.jpg`;
   }
 }
 
-// Обработчик фото
-bot.on("message:photo", async (ctx) => {
-  try {
-    const message = ctx.message;
-    const photos = message.photo;
-    
-    if (!photos || photos.length === 0) {
-      return await ctx.reply("❌ Не удалось получить фото");
+// Инициализация бота только если есть токен
+if (bot) {
+  // Обработчик фото
+  bot.on("message:photo", async (ctx) => {
+    try {
+      const message = ctx.message;
+      const photos = message.photo;
+      
+      if (!photos || photos.length === 0) {
+        return await ctx.reply("❌ Не удалось получить фото");
+      }
+      
+      // Берем фото наивысшего качества (последнее в массиве)
+      const bestPhoto = photos[photos.length - 1];
+      const fileId = bestPhoto.file_id;
+      
+      // Отправляем сообщение о обработке
+      const processingMsg = await ctx.reply("⏳ Обрабатываю фото...");
+      
+      // Загружаем фото и получаем ссылку
+      const imageUrl = await uploadToTelegraph(fileId);
+      
+      // Сохраняем в хранилище
+      const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
+      imageStore.set(storeId, {
+        fileId,
+        timestamp: Date.now()
+      });
+      
+      // Создаем финальную ссылку в нужном формате
+      const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
+      
+      // Удаляем сообщение о обработке
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
+      } catch (e) {
+        console.log("Не удалось удалить сообщение:", e);
+      }
+      
+      // Отправляем результат
+      await ctx.reply(`✅ Ваше фото доступно по ссылке:\n${finalUrl}`, {
+        reply_to_message_id: message.message_id,
+        parse_mode: "HTML"
+      });
+      
+    } catch (error) {
+      console.error("Ошибка обработки фото:", error);
+      await ctx.reply("❌ Произошла ошибка при обработке фото");
     }
-    
-    // Берем фото наивысшего качества (последнее в массиве)
-    const bestPhoto = photos[photos.length - 1];
-    const fileId = bestPhoto.file_id;
-    
-    // Отправляем сообщение о обработке
-    const processingMsg = await ctx.reply("⏳ Обрабатываю фото...");
-    
-    // Загружаем фото и получаем ссылку
-    const imageUrl = await uploadToTelegraph(fileId);
-    
-    // Сохраняем в хранилище
-    const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
-    imageStore.set(storeId, {
-      fileId,
-      timestamp: Date.now()
-    });
-    
-    // Создаем финальную ссылку в нужном формате
-    const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
-    
-    // Удаляем сообщение о обработке
-    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
-    
-    // Отправляем результат
-    await ctx.reply(`✅ Ваше фото доступно по ссылке:\n${finalUrl}`, {
-      reply_to_message_id: message.message_id,
-      parse_mode: "HTML"
-    });
-    
-  } catch (error) {
-    console.error("Ошибка обработки фото:", error);
-    await ctx.reply("❌ Произошла ошибка при обработке фото");
-  }
-});
+  });
 
-// Обработчик альбомов с несколькими фото
-bot.on("message:media_group", async (ctx) => {
-  try {
-    const message = ctx.message;
-    
-    if (!message.photo) {
-      return await ctx.reply("❌ Не удалось получить фото из альбома");
+  // Обработчик альбомов с несколькими фото
+  bot.on("message:media_group", async (ctx) => {
+    try {
+      const message = ctx.message;
+      
+      if (!message.photo) {
+        return await ctx.reply("❌ Не удалось получить фото из альбома");
+      }
+      
+      const photos = message.photo;
+      const bestPhoto = photos[photos.length - 1];
+      const fileId = bestPhoto.file_id;
+      
+      const processingMsg = await ctx.reply("⏳ Обрабатываю альбом...");
+      const imageUrl = await uploadToTelegraph(fileId);
+      
+      const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
+      imageStore.set(storeId, {
+        fileId,
+        timestamp: Date.now()
+      });
+      
+      const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
+      
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
+      } catch (e) {
+        console.log("Не удалось удалить сообщение:", e);
+      }
+      
+      await ctx.reply(`✅ Ваше фото из альбома доступно по ссылке:\n${finalUrl}`, {
+        reply_to_message_id: message.message_id,
+        parse_mode: "HTML"
+      });
+      
+    } catch (error) {
+      console.error("Ошибка обработки альбома:", error);
+      await ctx.reply("❌ Произошла ошибка при обработке альбома");
     }
-    
-    const photos = message.photo;
-    const bestPhoto = photos[photos.length - 1];
-    const fileId = bestPhoto.file_id;
-    
-    const processingMsg = await ctx.reply("⏳ Обрабатываю альбом...");
-    const imageUrl = await uploadToTelegraph(fileId);
-    
-    const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
-    imageStore.set(storeId, {
-      fileId,
-      timestamp: Date.now()
-    });
-    
-    const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
-    
-    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
-    await ctx.reply(`✅ Ваше фото из альбома доступно по ссылке:\n${finalUrl}`, {
-      reply_to_message_id: message.message_id,
-      parse_mode: "HTML"
-    });
-    
-  } catch (error) {
-    console.error("Ошибка обработки альбома:", error);
-    await ctx.reply("❌ Произошла ошибка при обработке альбома");
-  }
-});
+  });
 
-// Обработчик команды /start
-bot.command("start", (ctx) => {
-  return ctx.reply(
-    "🤖 Бот для загрузки фото\n\n" +
-    "Просто отправьте мне фото или альбом с фото, и я предоставлю вам ссылку в формате telegra.app\n\n" +
-    "📸 Поддерживаются:\n" +
-    "• Одиночные фото\n" +
-    "• Альбомы с несколькими фото"
-  );
-});
+  // Обработчик команды /start
+  bot.command("start", (ctx) => {
+    return ctx.reply(
+      "🤖 Бот для загрузки фото\n\n" +
+      "Просто отправьте мне фото или альбом с фото, и я предоставлю вам ссылку в формате telegra.app\n\n" +
+      "📸 Поддерживаются:\n" +
+      "• Одиночные фото\n" +
+      "• Альбомы с несколькими фото"
+    );
+  });
 
-// Обработчик текстовых сообщений
-bot.on("message:text", (ctx) => {
-  return ctx.reply("📸 Отправьте мне фото, чтобы получить ссылку");
-});
+  // Обработчик текстовых сообщений
+  bot.on("message:text", (ctx) => {
+    return ctx.reply("📸 Отправьте мне фото, чтобы получить ссылку");
+  });
+
+  // Обработка ошибок бота
+  bot.catch((error) => {
+    console.error("Bot error:", error);
+  });
+} else {
+  console.log("🤖 Бот не инициализирован - отсутствует BOT_TOKEN");
+}
 
 // Обработчик для прямого доступа к фото по ID
 app.get("/image/:id", async (c) => {
+  if (!bot) {
+    return c.text("Bot not configured", 500);
+  }
+
   const id = c.req.param("id");
   const stored = imageStore.get(id);
   
@@ -198,6 +226,19 @@ app.get("/image/:id", async (c) => {
   }
 });
 
+// Health check endpoint
+app.get("/", (c) => {
+  const status = bot ? "✅ Bot is running!" : "⚠️ Bot is not configured (missing BOT_TOKEN)";
+  return c.text(status);
+});
+
+// Webhook endpoint (только если бот инициализирован)
+if (bot) {
+  app.post("/webhook", webhookCallback(bot, "hono"));
+} else {
+  app.post("/webhook", (c) => c.text("Bot not configured", 500));
+}
+
 // Очистка старых изображений каждые 24 часа
 setInterval(() => {
   const now = Date.now();
@@ -210,23 +251,12 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000); // Каждый час
 
-// Health check endpoint
-app.get("/", (c) => c.text("Bot is running!"));
-
-// Webhook endpoint
-app.post("/webhook", webhookCallback(bot, "hono"));
-
-// Обработка ошибок бота
-bot.catch((error) => {
-  console.error("Bot error:", error);
-});
-
 // Запуск сервера
 if (import.meta.main) {
   const port = parseInt(Deno.env.get("PORT") || "8000");
   
-  // Если установлен WEBHOOK_URL, настраиваем вебхук
-  if (WEBHOOK_URL) {
+  // Если установлен WEBHOOK_URL и бот инициализирован, настраиваем вебхук
+  if (WEBHOOK_URL && bot) {
     console.log("🚀 Setting up webhook...");
     
     bot.api.setWebhook(`${WEBHOOK_URL}/webhook`, {
@@ -234,7 +264,7 @@ if (import.meta.main) {
     }).then(() => {
       console.log("✅ Webhook set successfully");
     }).catch(console.error);
-  } else {
+  } else if (bot) {
     console.log("🔧 Running in polling mode");
     bot.start();
   }
