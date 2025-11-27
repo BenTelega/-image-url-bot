@@ -8,7 +8,6 @@ const SECRET_TOKEN = Deno.env.get("SECRET_TOKEN") || crypto.randomUUID();
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN не установлен");
-  // В Deno Deploy нельзя использовать Deno.exit(), поэтому просто продолжаем
   console.log("⚠️  Бот будет работать в режиме только веб-сервера");
 }
 
@@ -18,6 +17,12 @@ const app = new Hono();
 
 // Хранилище для временных данных
 const imageStore = new Map<string, { fileId: string; timestamp: number }>();
+
+// Для обработки медиа-групп (альбомов)
+const processingAlbums = new Map<number, {
+  messages: any[];
+  timer: number;
+}>();
 
 // Функция для загрузки файла на Telegraph
 async function uploadToTelegraph(fileId: string): Promise<string> {
@@ -74,95 +79,146 @@ async function uploadToTelegraph(fileId: string): Promise<string> {
   }
 }
 
+// Функция для обработки одного фото
+async function processSinglePhoto(ctx: any) {
+  try {
+    const message = ctx.message;
+    const photos = message.photo;
+    
+    if (!photos || photos.length === 0) {
+      return await ctx.reply("❌ Не удалось получить фото");
+    }
+    
+    // Берем фото наивысшего качества (последнее в массиве)
+    const bestPhoto = photos[photos.length - 1];
+    const fileId = bestPhoto.file_id;
+    
+    // Отправляем сообщение о обработке
+    const processingMsg = await ctx.reply("⏳ Обрабатываю фото...");
+    
+    // Загружаем фото и получаем ссылку
+    const imageUrl = await uploadToTelegraph(fileId);
+    
+    // Сохраняем в хранилище
+    const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
+    imageStore.set(storeId, {
+      fileId,
+      timestamp: Date.now()
+    });
+    
+    // Создаем финальную ссылку в нужном формате
+    const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
+    
+    // Удаляем сообщение о обработке
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
+    } catch (e) {
+      console.log("Не удалось удалить сообщение:", e);
+    }
+    
+    // Отправляем результат
+    await ctx.reply(`✅ Ваше фото доступно по ссылке:\n<code>${finalUrl}</code>`, {
+      reply_to_message_id: message.message_id,
+      parse_mode: "HTML"
+    });
+    
+  } catch (error) {
+    console.error("Ошибка обработки фото:", error);
+    await ctx.reply("❌ Произошла ошибка при обработке фото");
+  }
+}
+
+// Функция для обработки медиа-группы (альбома)
+async function processMediaGroup(mediaGroupId: string, chatId: number) {
+  if (!bot) return;
+
+  const album = processingAlbums.get(chatId);
+  if (!album) return;
+
+  // Обрабатываем все сообщения в альбоме
+  const processingMsg = await bot.api.sendMessage(chatId, `⏳ Обрабатываю альбом из ${album.messages.length} фото...`);
+
+  const results = [];
+  
+  for (const message of album.messages) {
+    if (message.photo && message.photo.length > 0) {
+      const bestPhoto = message.photo[message.photo.length - 1];
+      const fileId = bestPhoto.file_id;
+      
+      try {
+        const imageUrl = await uploadToTelegraph(fileId);
+        const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
+        imageStore.set(storeId, {
+          fileId,
+          timestamp: Date.now()
+        });
+        
+        const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
+        results.push(finalUrl);
+      } catch (error) {
+        console.error("Ошибка обработки фото в альбоме:", error);
+      }
+    }
+  }
+
+  // Удаляем сообщение о обработке
+  try {
+    await bot.api.deleteMessage(chatId, processingMsg.message_id);
+  } catch (e) {
+    console.log("Не удалось удалить сообщение:", e);
+  }
+
+  // Отправляем результаты
+  if (results.length > 0) {
+    const resultText = results.map((url, index) => 
+      `${index + 1}. <code>${url}</code>`
+    ).join('\n');
+    
+    await bot.api.sendMessage(
+      chatId,
+      `✅ Ваш альбом из ${results.length} фото:\n\n${resultText}`,
+      { parse_mode: "HTML" }
+    );
+  } else {
+    await bot.api.sendMessage(chatId, "❌ Не удалось обработать фото в альбоме");
+  }
+
+  // Очищаем альбом из памяти
+  processingAlbums.delete(chatId);
+}
+
 // Инициализация бота только если есть токен
 if (bot) {
-  // Обработчик фото
+  // Обработчик фото (одиночных и в альбомах)
   bot.on("message:photo", async (ctx) => {
-    try {
-      const message = ctx.message;
-      const photos = message.photo;
+    const message = ctx.message;
+    
+    // Проверяем, является ли сообщение частью медиа-группы (альбома)
+    if (message.media_group_id) {
+      const chatId = message.chat.id;
+      const mediaGroupId = message.media_group_id;
       
-      if (!photos || photos.length === 0) {
-        return await ctx.reply("❌ Не удалось получить фото");
+      // Добавляем сообщение в обработку альбома
+      if (!processingAlbums.has(chatId)) {
+        processingAlbums.set(chatId, {
+          messages: [message],
+          timer: setTimeout(() => {
+            processMediaGroup(mediaGroupId, chatId);
+          }, 1000) // Ждем 1 секунду для сбора всех фото альбома
+        });
+      } else {
+        const album = processingAlbums.get(chatId)!;
+        album.messages.push(message);
+        
+        // Сбрасываем таймер при получении нового фото альбома
+        clearTimeout(album.timer);
+        album.timer = setTimeout(() => {
+          processMediaGroup(mediaGroupId, chatId);
+        }, 1000);
       }
-      
-      // Берем фото наивысшего качества (последнее в массиве)
-      const bestPhoto = photos[photos.length - 1];
-      const fileId = bestPhoto.file_id;
-      
-      // Отправляем сообщение о обработке
-      const processingMsg = await ctx.reply("⏳ Обрабатываю фото...");
-      
-      // Загружаем фото и получаем ссылку
-      const imageUrl = await uploadToTelegraph(fileId);
-      
-      // Сохраняем в хранилище
-      const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
-      imageStore.set(storeId, {
-        fileId,
-        timestamp: Date.now()
-      });
-      
-      // Создаем финальную ссылку в нужном формате
-      const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
-      
-      // Удаляем сообщение о обработке
-      try {
-        await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
-      } catch (e) {
-        console.log("Не удалось удалить сообщение:", e);
-      }
-      
-      // Отправляем результат
-      await ctx.reply(`✅ Ваше фото доступно по ссылке:\n${finalUrl}`, {
-        reply_to_message_id: message.message_id,
-        parse_mode: "HTML"
-      });
-      
-    } catch (error) {
-      console.error("Ошибка обработки фото:", error);
-      await ctx.reply("❌ Произошла ошибка при обработке фото");
-    }
-  });
-
-  // Обработчик альбомов с несколькими фото
-  bot.on("message:media_group", async (ctx) => {
-    try {
-      const message = ctx.message;
-      
-      if (!message.photo) {
-        return await ctx.reply("❌ Не удалось получить фото из альбома");
-      }
-      
-      const photos = message.photo;
-      const bestPhoto = photos[photos.length - 1];
-      const fileId = bestPhoto.file_id;
-      
-      const processingMsg = await ctx.reply("⏳ Обрабатываю альбом...");
-      const imageUrl = await uploadToTelegraph(fileId);
-      
-      const storeId = crypto.randomUUID().replace(/-/g, "").substring(0, 16);
-      imageStore.set(storeId, {
-        fileId,
-        timestamp: Date.now()
-      });
-      
-      const finalUrl = `https://telegra.app/imeg/${storeId}.jpg`;
-      
-      try {
-        await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
-      } catch (e) {
-        console.log("Не удалось удалить сообщение:", e);
-      }
-      
-      await ctx.reply(`✅ Ваше фото из альбома доступно по ссылке:\n${finalUrl}`, {
-        reply_to_message_id: message.message_id,
-        parse_mode: "HTML"
-      });
-      
-    } catch (error) {
-      console.error("Ошибка обработки альбома:", error);
-      await ctx.reply("❌ Произошла ошибка при обработке альбома");
+    } else {
+      // Одиночное фото
+      await processSinglePhoto(ctx);
     }
   });
 
@@ -173,13 +229,14 @@ if (bot) {
       "Просто отправьте мне фото или альбом с фото, и я предоставлю вам ссылку в формате telegra.app\n\n" +
       "📸 Поддерживаются:\n" +
       "• Одиночные фото\n" +
-      "• Альбомы с несколькими фото"
+      "• Альбомы с несколькими фото\n\n" +
+      "Отправьте фото чтобы начать!"
     );
   });
 
   // Обработчик текстовых сообщений
   bot.on("message:text", (ctx) => {
-    return ctx.reply("📸 Отправьте мне фото, чтобы получить ссылку");
+    return ctx.reply("📸 Отправьте мне фото или альбом с фото, чтобы получить ссылку");
   });
 
   // Обработка ошибок бота
