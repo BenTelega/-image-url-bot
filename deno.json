@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --watch bot.ts",
+    "start": "deno run --allow-net --allow-env bot.ts"
+  },
+  "imports": {
+    "hono": "https://deno.land/x/hono@v3.11.7/mod.ts",
+    "grammy": "https://deno.land/x/grammy@v1.21.1/mod.ts"
+  }
+}
